@@ -4,7 +4,7 @@ __device__ void prefixSum(int arr[], int len, int tid, int threads)
 {
     //TODO
     int increment;
-
+    
     for(int stride = 1; stride < threads; stride *= 2)
     {
         if(tid >= stride && tid < len)
@@ -64,12 +64,12 @@ __device__ void colorHist(uchar img[][CHANNELS], int histograms[][LEVELS])
     int tid = threadIdx.x;
     int threads = blockDim.x;
     
-    // Init
+    // Init the histograms
     if(tid < LEVELS)
     {
-        histograms[0][tid] = 0;
-        histograms[1][tid] = 0;
-        histograms[2][tid] = 0;
+        histograms[0][tid] = 0; // Red channel
+        histograms[1][tid] = 0; // Green channel
+        histograms[2][tid] = 0; // Blue channel
     }
 
     __syncthreads();
@@ -77,13 +77,13 @@ __device__ void colorHist(uchar img[][CHANNELS], int histograms[][LEVELS])
     for(int i = tid; i < SIZE * SIZE; i += threads)
     {
         // Red channel
-        atomicAdd(histograms[0] + img[i][0], 1);
+        atomicAdd_block(histograms[0] + img[i][0], 1);
 
         // Green channel
-        atomicAdd(histograms[1] + img[i][1], 1);
+        atomicAdd_block(histograms[1] + img[i][1], 1);
 
         // Blue channel
-        atomicAdd(histograms[2] + img[i][2], 1);
+        atomicAdd_block(histograms[2] + img[i][2], 1);
     }
 
     __syncthreads();
@@ -97,9 +97,9 @@ __device__ void performMapping(uchar maps[][LEVELS], uchar targetImg[][CHANNELS]
     
     for(int i = tid; i < SIZE * SIZE; i += threads)
     {
-        resultImg[i][0] = maps[0][targetImg[i][0]];
-        resultImg[i][1] = maps[1][targetImg[i][1]];
-        resultImg[i][2] = maps[2][targetImg[i][2]];
+        resultImg[i][0] = maps[0][targetImg[i][0]]; // Red channel
+        resultImg[i][1] = maps[1][targetImg[i][1]]; // Green channel
+        resultImg[i][2] = maps[2][targetImg[i][2]]; // Blue channel
     }
 
     __syncthreads();
@@ -114,7 +114,7 @@ __device__ void calculateMap(uchar maps[LEVELS], int targetHist[LEVELS], int ref
 
     for(int i_tar = 0; i_tar < LEVELS; i_tar++){
         for(int i_ref = tid; i_ref < LEVELS; i_ref += threads){
-            diff[tid] = abs(refrenceHist[tid] - targetHist[i_tar]);
+            diff[i_ref] = abs(refrenceHist[i_ref] - targetHist[i_tar]);
         }
 
         __syncthreads();
@@ -123,7 +123,7 @@ __device__ void calculateMap(uchar maps[LEVELS], int targetHist[LEVELS], int ref
         
         __syncthreads();
 
-        if(tid == 0)
+        if(tid == 0) // For preventing bank conflicts
         {
             maps[i_tar] = diff[1];
         }
@@ -261,7 +261,7 @@ void gpu_bulk_process(struct gpu_bulk_context *context, uchar *images_target, uc
     cudaMemcpy(context->targets, images_target, N_IMAGES * SIZE * SIZE * CHANNELS * sizeof(uchar), cudaMemcpyHostToDevice);
     cudaMemcpy(context->references, images_refrence, N_IMAGES * SIZE * SIZE * CHANNELS * sizeof(uchar), cudaMemcpyHostToDevice);
     
-    //cudaDeviceSynchronize();
+    cudaDeviceSynchronize();
 
     process_image_kernel<<<N_IMAGES, 1024>>>(context->targets, context->references, context->results);
 
