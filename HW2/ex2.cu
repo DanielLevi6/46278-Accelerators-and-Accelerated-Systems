@@ -161,6 +161,7 @@ __device__ void calculateMap(uchar maps[LEVELS], int targetHist[LEVELS], int ref
 }
 /************************** Image processing funcs - end **************************/
 
+/****************************** Process image kernel ******************************/
 __device__
 void process_image(uchar *target, uchar *reference, uchar *result) {
     // TODO complete according to hw1
@@ -202,6 +203,10 @@ __global__
 void process_image_kernel(uchar *target, uchar *reference, uchar *result){
     process_image(target, reference, result);
 }
+
+/*************************** Process image kernel - end ***************************/
+
+/***************************** Streams implementation *****************************/
 
 class streams_server : public image_processing_server
 {
@@ -295,7 +300,9 @@ std::unique_ptr<image_processing_server> create_streams_server()
     return std::make_unique<streams_server>();
 }
 
-/******************************** SPSC Queue implementation ********************************/
+/************************** Streams implementation - end **************************/
+
+/*************************** SPSC Queue implementation ****************************/
 
 typedef struct{
     uchar *target;
@@ -309,47 +316,48 @@ typedef struct{
 class RingBuffer 
 {
 private:
-    size_t N;
     Request* _requests;
-    char* _requests_buff;
     cuda::atomic<size_t> _head, _tail;
 
 public:
-    RingBuffer() : _head(0), _tail(0), N(QUEUE_SLOTS) {
-        CUDA_CHECK(cudaMallocHost(&_requests_buff, N * sizeof(Request)));
-        _requests = reinterpret_cast<Request*>(_requests_buff);
-        for(size_t i=0; i<N; i++)
+    __host__ RingBuffer() : _head(0), _tail(0) {
+        CUDA_CHECK(cudaMallocHost(&_requests, QUEUE_SLOTS * sizeof(Request)));
+        for(size_t i=0; i<QUEUE_SLOTS; i++)
         {
             new(&_requests[i]) Request();
             _requests[i].image_id = NO_ID;
         }
-
     }
 
-    ~RingBuffer() {
-        CUDA_CHECK(cudaFreeHost(_requests_buff));
+    __host__ ~RingBuffer() {
+        CUDA_CHECK(cudaFreeHost(_requests));
     }
 
-    __device__ __host__ bool push(const Request data) {
-        size_t tail = _tail.load(cuda::memory_order_relaxed);
-        if(tail - _head.load(cuda::memory_order_acquire) != N)
+    __device__ __host__ bool push(const Request &data) {
+        int tail = _tail.load(cuda::memory_order_relaxed);
+        if(tail - _head.load(cuda::memory_order_acquire) == QUEUE_SLOTS)
         {
-            _requests[_tail % N] = data;
-            _tail.store(tail + 1, cuda::memory_order_release);
-            return true;
-        }
-        else{
             return false;
         }
+        _requests[_tail % QUEUE_SLOTS] = data;
+        _tail.store(tail + 1, cuda::memory_order_release);
+        return true;
     }
 
     __device__ __host__ Request pop() {
         Request item;
+        item.target = nullptr;
+        item.reference = nullptr;
+        item.result = nullptr;
         item.image_id = NO_ID;
         int head = _head.load(cuda::memory_order_relaxed);
         if(_tail.load(cuda::memory_order_acquire) != _head)
         {
-            item = _requests[_head % N];
+            item = _requests[_head % QUEUE_SLOTS];
+            _requests[_head % QUEUE_SLOTS].target = nullptr;
+            _requests[_head % QUEUE_SLOTS].reference = nullptr;
+            _requests[_head % QUEUE_SLOTS].result = nullptr;
+            _requests[_head % QUEUE_SLOTS].image_id = NO_ID;
             _head.store(head + 1, cuda::memory_order_release);
         }
         return item;
@@ -359,7 +367,11 @@ public:
 // TODO implement the persistent kernel
 __global__ void persistent_processing_kernel(RingBuffer* cpu_to_gpu_queues, RingBuffer* gpu_to_cpu_queues)
 {
-    Request request;
+    __shared__ Request request;
+    request.target = nullptr;
+    request.reference = nullptr;
+    request.result = nullptr;
+    request.image_id = NO_ID;
 
     while(1)
     {
@@ -374,7 +386,7 @@ __global__ void persistent_processing_kernel(RingBuffer* cpu_to_gpu_queues, Ring
             break;
         }
 
-        if(request.image_id != NO_ID || request.image_id != STOP)
+        if(request.image_id != NO_ID && request.image_id != STOP)
         {
             __syncthreads();
             process_image(request.target, request.reference, request.result);
@@ -384,6 +396,7 @@ __global__ void persistent_processing_kernel(RingBuffer* cpu_to_gpu_queues, Ring
             {
                 while(!gpu_to_cpu_queues[blockIdx.x].push(request));
             }
+            __syncthreads();
         }
     }
 }
@@ -430,8 +443,8 @@ public:
         
         for(int i=0; i<blocks; i++)
         {
-            new(cpu_to_gpu_queues + (i * sizeof(RingBuffer))) RingBuffer();
-            new(gpu_to_cpu_queues + (i * sizeof(RingBuffer))) RingBuffer();
+            new(&cpu_to_gpu_queues[i]) RingBuffer();
+            new(&gpu_to_cpu_queues[i]) RingBuffer();
         }
 
         // TODO launch GPU persistent kernel with given number of threads, and calculated number of threadblocks
@@ -473,15 +486,21 @@ public:
     bool dequeue(int *job_id) override
     {
         // TODO query (don't block) the producer-consumer queue for any responses.
+        Request request;
+        request.target = nullptr;
+        request.reference = nullptr;
+        request.result = nullptr;
+        request.image_id = NO_ID;
+
         for(int i=0; i<blocks; i++)
         {
-            Request request = gpu_to_cpu_queues[i].pop();
-            if(request.image_id != NO_ID)
-            {
-                // TODO return the job_id of the request that was completed.
-                *job_id = request.image_id;
-                return true;
+            request = gpu_to_cpu_queues[i].pop();
+            if(request.image_id == NO_ID){
+                continue;
             }
+            // TODO return the job_id of the request that was completed.
+            *job_id = request.image_id;
+            return true;
         }
         return false;
     }
@@ -491,3 +510,5 @@ std::unique_ptr<image_processing_server> create_queues_server(int threads)
 {
     return std::make_unique<queue_server>(threads);
 }
+
+/************************ SPSC Queue implementation - end *************************/
