@@ -6,12 +6,14 @@
 #define QUEUE_SLOTS 4
 #define REGISTERS_PER_THREAD 32
 /*
+Each block calculates an image
+
 In calculateMap-    __shared__ int diff[LEVELS]
 In process_image-   __shared__ int targetHist[CHANNELS][LEVELS];
                     __shared__ int refrenceHist[CHANNELS][LEVELS];
                     __shared__ uchar maps[CHANNELS][LEVELS];
 */
-#define SHMEM_PER_THREAD ((LEVELS * sizeof(int)) + 2 * (LEVELS * CHANNELS * sizeof(int)) + (LEVELS * CHANNELS * sizeof(uchar)))
+#define SHMEM_PER_BLOCK ((LEVELS * sizeof(int)) + 2 * (LEVELS * CHANNELS * sizeof(int)) + (LEVELS * CHANNELS * sizeof(uchar)))
 
 typedef struct{
     cudaStream_t stream;
@@ -309,33 +311,36 @@ class RingBuffer
 private:
     size_t N;
     Request* _requests;
+    char* _requests_buff;
     cuda::atomic<size_t> _head, _tail;
 
 public:
-    RingBuffer(int size) {
-        N = size;
-        CUDA_CHECK(cudaMallocHost(&_requests, N * sizeof(Request)));
+    RingBuffer() : _head(0), _tail(0), N(QUEUE_SLOTS) {
+        CUDA_CHECK(cudaMallocHost(&_requests_buff, N * sizeof(Request)));
+        _requests = reinterpret_cast<Request*>(_requests_buff);
         for(size_t i=0; i<N; i++)
         {
-            new(_requests + (i * sizeof(Request))) Request();
+            new(&_requests[i]) Request();
+            _requests[i].image_id = NO_ID;
         }
-        _head = 0;
-        _tail = 0;
+
     }
 
     ~RingBuffer() {
-        CUDA_CHECK(cudaFreeHost(_requests));
+        CUDA_CHECK(cudaFreeHost(_requests_buff));
     }
 
-    __device__ __host__ bool push(const Request &data) {
-        int tail = _tail.load(cuda::memory_order_relaxed);
+    __device__ __host__ bool push(const Request data) {
+        size_t tail = _tail.load(cuda::memory_order_relaxed);
         if(tail - _head.load(cuda::memory_order_acquire) != N)
         {
             _requests[_tail % N] = data;
             _tail.store(tail + 1, cuda::memory_order_release);
             return true;
         }
-        return false;
+        else{
+            return false;
+        }
     }
 
     __device__ __host__ Request pop() {
@@ -354,9 +359,9 @@ public:
 // TODO implement the persistent kernel
 __global__ void persistent_processing_kernel(RingBuffer* cpu_to_gpu_queues, RingBuffer* gpu_to_cpu_queues)
 {
-    __shared__ Request request;
+    Request request;
 
-    while(request.image_id != STOP)
+    while(1)
     {
         if(threadIdx.x == 0)
         {
@@ -364,8 +369,14 @@ __global__ void persistent_processing_kernel(RingBuffer* cpu_to_gpu_queues, Ring
         }
         __syncthreads();
 
+        if(request.image_id == STOP)
+        {
+            break;
+        }
+
         if(request.image_id != NO_ID || request.image_id != STOP)
         {
+            __syncthreads();
             process_image(request.target, request.reference, request.result);
             __syncthreads();
 
@@ -384,7 +395,7 @@ int calcTBcount(int threads_per_tb)
     CUDA_CHECK(cudaGetDeviceProperties(&device, 0));
 
     int registers_per_tb = threads_per_tb * REGISTERS_PER_THREAD;
-    int shmem_per_tb = threads_per_tb * SHMEM_PER_THREAD;
+    int shmem_per_tb = SHMEM_PER_BLOCK;
 
     int max_tb_per_sm_registers = device.regsPerMultiprocessor / registers_per_tb;
     int max_tb_per_sm_shmem = device.sharedMemPerMultiprocessor / shmem_per_tb;
@@ -398,7 +409,10 @@ class queue_server : public image_processing_server
 private:
     // TODO define queue server context (memory buffers, etc...)
     RingBuffer* cpu_to_gpu_queues;
+    char* cpu_to_gpu_queues_buf;
     RingBuffer* gpu_to_cpu_queues;
+    char* gpu_to_cpu_queues_buf;
+
     int curr_block;
     int blocks;
 public:
@@ -409,13 +423,15 @@ public:
         blocks = calcTBcount(threads);
 
         // TODO initialize host state
-        CUDA_CHECK(cudaMallocHost(&cpu_to_gpu_queues, blocks * sizeof(RingBuffer)));
-        CUDA_CHECK(cudaMallocHost(&gpu_to_cpu_queues, blocks * sizeof(RingBuffer)));
+        CUDA_CHECK(cudaMallocHost(&cpu_to_gpu_queues_buf, blocks * sizeof(RingBuffer)));
+        cpu_to_gpu_queues = reinterpret_cast<RingBuffer*>(cpu_to_gpu_queues_buf);
+        CUDA_CHECK(cudaMallocHost(&gpu_to_cpu_queues_buf, blocks * sizeof(RingBuffer)));
+        gpu_to_cpu_queues = reinterpret_cast<RingBuffer*>(gpu_to_cpu_queues_buf);
         
         for(int i=0; i<blocks; i++)
         {
-            new(cpu_to_gpu_queues + (i * sizeof(RingBuffer))) RingBuffer(QUEUE_SLOTS);
-            new(gpu_to_cpu_queues + (i * sizeof(RingBuffer))) RingBuffer(QUEUE_SLOTS);
+            new(cpu_to_gpu_queues + (i * sizeof(RingBuffer))) RingBuffer();
+            new(gpu_to_cpu_queues + (i * sizeof(RingBuffer))) RingBuffer();
         }
 
         // TODO launch GPU persistent kernel with given number of threads, and calculated number of threadblocks
@@ -435,21 +451,21 @@ public:
             cpu_to_gpu_queues[i].~RingBuffer();
             gpu_to_cpu_queues[i].~RingBuffer();
         }
-        CUDA_CHECK(cudaFreeHost(cpu_to_gpu_queues));
-        CUDA_CHECK(cudaFreeHost(gpu_to_cpu_queues));
+        CUDA_CHECK(cudaFreeHost(cpu_to_gpu_queues_buf));
+        CUDA_CHECK(cudaFreeHost(gpu_to_cpu_queues_buf));
     }
 
     bool enqueue(int job_id, uchar *target, uchar *reference, uchar *result) override
     {
         // TODO push new task into queue if possible
         Request new_request;
-        new_request.image_id = job_id;
         new_request.target = target;
         new_request.reference = reference;
         new_request.result = result;
+        new_request.image_id = job_id;
 
         bool res = cpu_to_gpu_queues[curr_block].push(new_request);
-        // curr_block = (curr_block + 1) % blocks;
+        curr_block = (curr_block + 1) % blocks;
 
         return res;
     }
