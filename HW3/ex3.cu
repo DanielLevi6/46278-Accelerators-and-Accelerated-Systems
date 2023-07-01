@@ -273,26 +273,73 @@ public:
     }
 };
 
+struct queues_parameters {
+    uint32_t cpu_to_gpu_mr_rkey;
+    RingBuffer* cpu_to_gpu_mr_addr;
+    uint32_t gpu_to_cpu_mr_rkey;
+    RingBuffer* gpu_to_cpu_mr_addr;
+    uint32_t mr_images_target_rkey;
+    uchar* mr_images_target_addr;
+    uint32_t mr_images_reference_rkey;
+    uchar* mr_images_reference_addr;
+    uint32_t mr_images_out_rkey;
+    uchar* mr_images_out_addr;
+
+    int number_of_queues;
+};
+
 class server_queues_context : public rdma_server_context {
 private:
-    queue_server gpu_context;
+    std::unique_ptr<queue_server> gpu_context;
 
     /* TODO: add memory region(s) for CPU-GPU queues */
+    struct ibv_mr* cpu_to_gpu_mr;
+    struct ibv_mr* gpu_to_cpu_mr;
 
 public:
     explicit server_queues_context(uint16_t tcp_port) :
         rdma_server_context(tcp_port),
-        gpu_context(256)
+        gpu_context(create_queues_server(256))
     {
         /* TODO Initialize additional server MRs as needed. */
+        RingBuffer *cpu_to_gpu_queues = gpu_context->cpu_to_gpu_queues;
+        RingBuffer *gpu_to_cpu_queues = gpu_context->gpu_to_cpu_queues;
+        int blocks = gpu_context->blocks;
+        
+        cpu_to_gpu_mr = ibv_reg_mr(pd, cpu_to_gpu_queues, blocks * sizeof(RingBuffer), IBV_ACCESS_REMOTE_READ | IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+        if (!cpu_to_gpu_mr) {
+            perror("ibv_reg_mr() failed for input images");
+            exit(1);
+        }
+        gpu_to_cpu_mr = ibv_reg_mr(pd, gpu_to_cpu_queues, blocks * sizeof(RingBuffer), IBV_ACCESS_REMOTE_READ | IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+        if (!gpu_to_cpu_mr) {
+            perror("ibv_reg_mr() failed for input images");
+            exit(1);
+        }
 
         /* TODO Exchange rkeys, addresses, and necessary information (e.g.
          * number of queues) with the client */
+        struct queues_parameters gpu_queues_parameters = 
+                {cpu_to_gpu_mr->rkey,
+                cpu_to_gpu_queues,
+                gpu_to_cpu_mr->rkey,
+                gpu_to_cpu_queues,
+                mr_images_target->rkey,
+                images_target,
+                mr_images_reference->rkey,
+                images_reference,
+                mr_images_out->rkey,
+                images_out,
+                blocks};
+
+        send_over_socket(&gpu_queues_parameters, sizeof(struct queues_parameters));
     }
 
     ~server_queues_context()
     {
         /* TODO destroy the additional server MRs here */
+        ibv_dereg_mr(cpu_to_gpu_mr);
+        ibv_dereg_mr(gpu_to_cpu_mr);
     }
 
     virtual void event_loop() override
@@ -300,17 +347,41 @@ public:
         /* TODO simplified version of server_rpc_context::event_loop. As the
          * client use one sided operations, we only need one kind of message to
          * terminate the server at the end. */
+        bool terminate_server = false;
+        while(terminate_server == false) {
+            recv_over_socket(&terminate_server, sizeof(bool));
+        }
     }
 };
+
+uint64_t atomic_sizet_size = sizeof(cuda::atomic<size_t>);
 
 class client_queues_context : public rdma_client_context {
 private:
     /* TODO add necessary context to track the client side of the GPU's
      * producer/consumer queues */
+    struct queues_parameters gpu_queues_parameters;
 
-    struct ibv_mr *mr_images_in; /* Memory region for input images */
+    struct ibv_mr *mr_images_target, *mr_images_reference; /* Memory region for input images */
     struct ibv_mr *mr_images_out; /* Memory region for output images */
     /* TODO define other memory regions used by the client here */
+    RingBuffer cpu_to_gpu_ring_buff;
+    struct ibv_mr* cpu_to_gpu_ring_buff_mr;
+    RingBuffer gpu_to_cpu_ring_buff;
+    struct ibv_mr* gpu_to_cpu_ring_buff_mr;
+
+    QueueRequest request;
+    struct ibv_mr* request_mr;
+
+    cuda::atomic<size_t> gpu_to_cpu_head, cpu_to_gpu_tail;
+    struct ibv_mr* gpu_to_cpu_head_mr;
+    struct ibv_mr* cpu_to_gpu_tail_mr;
+
+    int next_block_enqueue = 0;
+    int next_block_dequeue = 0;
+
+    uint32_t requests_sent = 0;
+    uint32_t send_cqes_received = 0;
 
 public:
     client_queues_context(uint16_t tcp_port) : rdma_client_context(tcp_port)
@@ -318,35 +389,348 @@ public:
         /* TODO communicate with server to discover number of queues, necessary
          * rkeys / address, or other additional information needed to operate
          * the GPU queues remotely. */
+        printf("Waiting for server...\n");
+        recv_over_socket(&gpu_queues_parameters, sizeof(struct queues_parameters));
+        printf("Received server parameters\n");
+
+        printf("Creating memory regions...\n");
+        /* TODO register memory regions for CPU-GPU queues */
+        cpu_to_gpu_ring_buff_mr = ibv_reg_mr(pd, &cpu_to_gpu_ring_buff, sizeof(RingBuffer), IBV_ACCESS_REMOTE_READ | IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+        if (!cpu_to_gpu_ring_buff_mr) {
+            perror("ibv_reg_mr() failed for input images");
+            exit(1);
+        }
+
+        gpu_to_cpu_ring_buff_mr = ibv_reg_mr(pd, &gpu_to_cpu_ring_buff, sizeof(RingBuffer), IBV_ACCESS_REMOTE_READ | IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+        if (!gpu_to_cpu_ring_buff_mr) {
+            perror("ibv_reg_mr() failed for input images");
+            exit(1);
+        }
+
+        /* TODO register memory regions for GPU-CPU head and tail */
+        gpu_to_cpu_head_mr = ibv_reg_mr(pd, &gpu_to_cpu_head, atomic_sizet_size, IBV_ACCESS_REMOTE_READ | IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+        if (!gpu_to_cpu_head_mr) {
+            perror("ibv_reg_mr() failed for input images");
+            exit(1);
+        }
+
+        cpu_to_gpu_tail_mr = ibv_reg_mr(pd, &cpu_to_gpu_tail, atomic_sizet_size, IBV_ACCESS_REMOTE_READ | IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+        if (!cpu_to_gpu_tail_mr) {
+            perror("ibv_reg_mr() failed for input images");
+            exit(1);
+        }
+
+        request_mr = ibv_reg_mr(pd, &request, sizeof(QueueRequest), IBV_ACCESS_REMOTE_READ | IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+        if (!request_mr) {
+            perror("ibv_reg_mr() failed for input images");
+            exit(1);
+        }
+
+        printf("Registered memory regions\n");
     }
 
     ~client_queues_context()
     {
-	/* TODO terminate the server and release memory regions and other resources */
+        /* TODO terminate the server and release memory regions and other resources */
+        printf("Terminating server...\n");
+        bool terminate_server = true;
+        send_over_socket(&terminate_server, sizeof(bool));
+        ibv_dereg_mr(cpu_to_gpu_ring_buff_mr);
+        ibv_dereg_mr(gpu_to_cpu_ring_buff_mr);
+        ibv_dereg_mr(gpu_to_cpu_head_mr);
+        ibv_dereg_mr(cpu_to_gpu_tail_mr);
+        ibv_dereg_mr(request_mr);
+        ibv_dereg_mr(mr_images_target);
+        ibv_dereg_mr(mr_images_reference);
+        ibv_dereg_mr(mr_images_out);
+        printf("Terminated server\n");
     }
 
     virtual void set_input_images(uchar *images_target, uchar* images_reference, size_t bytes) override
     {
+        printf("Setting input images\n");
         // TODO register memory
+        mr_images_target = ibv_reg_mr(pd, images_target, bytes, IBV_ACCESS_REMOTE_READ | IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+        if (!mr_images_target) {
+            perror("ibv_reg_mr() failed for input images");
+            exit(1);
+        }
+        mr_images_reference = ibv_reg_mr(pd, images_reference, bytes, IBV_ACCESS_REMOTE_READ | IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+        if (!mr_images_reference) {
+            perror("ibv_reg_mr() failed for input images");
+            exit(1);
+        }
+        printf("Set input images\n");
     }
 
     virtual void set_output_images(uchar *images_out, size_t bytes) override
     {
+        printf("Setting output images\n");
         // TODO register memory
+        mr_images_out = ibv_reg_mr(pd, images_out, bytes, IBV_ACCESS_REMOTE_READ | IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+        if (!mr_images_out) {
+            perror("ibv_reg_mr() failed for input images");
+            exit(1);
+        }
+        printf("Set output images\n");
     }
 
     virtual bool enqueue(int job_id, uchar *target, uchar *reference, uchar *result) override
     {
+        printf("Enqueuing job %d\n", job_id);
+        if (requests_sent - send_cqes_received == OUTSTANDING_REQUESTS)
+        {
+            return false;
+        }
         /* TODO use RDMA Write and RDMA Read operations to enqueue the task on
          * a CPU-GPU producer consumer queue running on the server. */
-        return false;
+        struct ibv_wc wc; /* CQE */
+        int ncqes;
+
+        wc.wr_id = 11;
+
+        RingBuffer* ring_buffer = &(gpu_queues_parameters.cpu_to_gpu_mr_addr[next_block_enqueue]);
+        next_block_enqueue = (next_block_enqueue + 1) % gpu_queues_parameters.number_of_queues;
+        printf("Ring buffer: %p\n", ring_buffer);
+        
+        post_rdma_read(
+            &cpu_to_gpu_ring_buff,
+            sizeof(RingBuffer),
+            cpu_to_gpu_ring_buff_mr->lkey,
+            (uint64_t)(ring_buffer),
+            gpu_queues_parameters.cpu_to_gpu_mr_rkey,
+            wc.wr_id
+        );
+        
+        while (( ncqes = ibv_poll_cq(cq, 1, &wc)) == 0) { }
+        if (ncqes < 0) {
+            perror("ibv_poll_cq() failed");
+            exit(1);
+        }
+        VERBS_WC_CHECK(wc);
+
+       if(cpu_to_gpu_ring_buff._tail - cpu_to_gpu_ring_buff._head == QUEUE_SLOTS)
+        {
+            printf("Queue full\n");
+            return false;
+        }
+        printf("after if full\n");
+
+        wc.wr_id = 12;
+
+        uint64_t target_image_r_addr = (uint64_t)gpu_queues_parameters.mr_images_target_addr + ((job_id % OUTSTANDING_REQUESTS) * IMG_BYTES);
+        // uint64_t target_remote_addr = (uint64_t)ring_buffer + sizeof(size_t) + (sizeof(QueueRequest) * (tail % QUEUE_SLOTS));
+        post_rdma_write(
+            target_image_r_addr,
+            IMG_BYTES,
+            gpu_queues_parameters.mr_images_target_rkey,
+            target,
+            mr_images_target->lkey,
+            wc.wr_id
+        );        
+
+        while (( ncqes = ibv_poll_cq(cq, 1, &wc)) == 0) { }
+        if (ncqes < 0) {
+            perror("ibv_poll_cq() failed");
+            exit(1);
+        }
+        VERBS_WC_CHECK(wc);
+
+        wc.wr_id = 13;
+
+        uint64_t reference_image_r_addr = (uint64_t)gpu_queues_parameters.mr_images_reference_addr + ((job_id % OUTSTANDING_REQUESTS) * IMG_BYTES);
+        // uint64_t reference_remote_addr = (uint64_t)ring_buffer + sizeof(size_t) + (sizeof(QueueRequest) * (tail % QUEUE_SLOTS)) + sizeof(uchar*);
+        post_rdma_write(
+            reference_image_r_addr,
+            IMG_BYTES,
+            gpu_queues_parameters.mr_images_reference_rkey,
+            reference,
+            mr_images_reference->lkey,
+            wc.wr_id
+        );
+
+        while (( ncqes = ibv_poll_cq(cq, 1, &wc)) == 0) { }
+        if (ncqes < 0) {
+            perror("ibv_poll_cq() failed");
+            exit(1);
+        }
+        VERBS_WC_CHECK(wc);
+
+        request.image_id = job_id;
+        request.target = (uchar*)(target_image_r_addr);
+        request.reference = (uchar*)(reference_image_r_addr);
+
+        wc.wr_id = 14;
+        post_rdma_write(
+            (uint64_t)ring_buffer + sizeof(size_t) + (sizeof(QueueRequest) * (cpu_to_gpu_ring_buff._tail % QUEUE_SLOTS)),
+            sizeof(QueueRequest),
+            gpu_queues_parameters.cpu_to_gpu_mr_rkey,
+            &request,
+            request_mr->lkey,
+            // cpu_to_gpu_ring_buff_mr->lkey,
+            wc.wr_id
+        );
+
+        while (( ncqes = ibv_poll_cq(cq, 1, &wc)) == 0) { }
+        if (ncqes < 0) {
+            perror("ibv_poll_cq() failed");
+            exit(1);
+        }
+        VERBS_WC_CHECK(wc);
+
+        wc.wr_id = 15;
+
+        cpu_to_gpu_tail = cpu_to_gpu_ring_buff._tail + 1;
+        uint64_t tail_remote_addr = (uint64_t)ring_buffer + sizeof(size_t) + (sizeof(QueueRequest) * QUEUE_SLOTS) + atomic_sizet_size;
+        post_rdma_write(
+            tail_remote_addr,
+            sizeof(cpu_to_gpu_tail),
+            gpu_queues_parameters.cpu_to_gpu_mr_rkey,
+            &cpu_to_gpu_tail,
+            cpu_to_gpu_tail_mr->lkey,
+            wc.wr_id,
+            nullptr
+        );
+
+        while (( ncqes = ibv_poll_cq(cq, 1, &wc)) == 0) { }
+        if (ncqes < 0) {
+            perror("ibv_poll_cq() failed");
+            exit(1);
+        }
+        VERBS_WC_CHECK(wc);
+
+        requests_sent++;
+
+        printf("Enqueued job %d\n", job_id);
+        
+        return true;
     }
 
     virtual bool dequeue(int *img_id) override
     {
         /* TODO use RDMA Write and RDMA Read operations to detect the completion and dequeue a processed image
          * through a CPU-GPU producer consumer queue running on the server. */
-        return false;
+        printf("Dequeueing job\n");
+
+        struct ibv_wc wc; /* CQE */
+        int ncqes;
+
+        wc.wr_id = 21;
+
+        RingBuffer* ring_buffer = &gpu_queues_parameters.gpu_to_cpu_mr_addr[next_block_dequeue];
+        next_block_dequeue = (next_block_dequeue + 1) % gpu_queues_parameters.number_of_queues;
+        printf("Ring buffer: %p\n", ring_buffer);
+        
+        post_rdma_read(
+            &gpu_to_cpu_ring_buff,
+            sizeof(RingBuffer),
+            gpu_to_cpu_ring_buff_mr->lkey,
+            (uint64_t)(ring_buffer),
+            gpu_queues_parameters.gpu_to_cpu_mr_rkey,
+            wc.wr_id
+        );
+        
+        while (( ncqes = ibv_poll_cq(cq, 1, &wc)) == 0) { }
+        if (ncqes < 0) {
+            perror("ibv_poll_cq() failed");
+            exit(1);
+        }
+        VERBS_WC_CHECK(wc);
+
+        // uint64_t tail_remote_addr = (uint64_t)ring_buffer + sizeof(size_t) + (sizeof(QueueRequest) * QUEUE_SLOTS) + atomic_sizet_size;
+        // post_rdma_read(
+        //     (void*)(tail_remote_addr),
+        //     atomic_sizet_size,
+        //     tail_mr->lkey,
+        //     (uint64_t)(&tail),
+        //     gpu_queues_parameters.cpu_to_gpu_mr_rkey,
+        //     0
+        // );
+
+        // cuda::atomic<size_t> head;
+        // struct ibv_mr *head_mr = ibv_reg_mr(pd, &head, atomic_sizet_size, IBV_ACCESS_REMOTE_READ | IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+        // if (!head_mr) {
+        //     perror("ibv_reg_mr() failed for input images");
+        //     exit(1);
+        // }
+        // uint64_t head_remote_addr = (uint64_t)ring_buffer + sizeof(size_t) + (sizeof(QueueRequest) * QUEUE_SLOTS);
+        // post_rdma_read(
+        //     (void*)(head_remote_addr),
+        //     atomic_sizet_size,
+        //     head_mr->lkey,
+        //     (uint64_t)(&head),
+        //     gpu_queues_parameters.cpu_to_gpu_mr_rkey,
+        //     0
+        // );
+
+        if(gpu_to_cpu_ring_buff._tail == gpu_to_cpu_ring_buff._head)
+        {
+            printf("Queue empty\n");
+            return false;
+        }
+        
+        // set_output_images(images_out, IMG_BYTES);
+
+        wc.wr_id = 22;
+        post_rdma_read(
+            &request,
+            sizeof(QueueRequest),
+            request_mr->lkey,
+            // (uint64_t)(ring_buffer),
+            (uint64_t)gpu_queues_parameters.gpu_to_cpu_mr_addr + sizeof(size_t) + sizeof(QueueRequest) * (gpu_to_cpu_ring_buff._head % QUEUE_SLOTS),
+            gpu_queues_parameters.gpu_to_cpu_mr_rkey,
+            wc.wr_id
+        );
+
+        while (( ncqes = ibv_poll_cq(cq, 1, &wc)) == 0) { }
+        if (ncqes < 0) {
+            perror("ibv_poll_cq() failed");
+            exit(1);
+        }
+
+        wc.wr_id = 23;
+        uint64_t output_image_r_addr = (uint64_t)gpu_queues_parameters.mr_images_out_addr + ((request.image_id % OUTSTANDING_REQUESTS) * IMG_BYTES);
+        // uint64_t output_remote_addr = (uint64_t)ring_buffer + sizeof(size_t) + (sizeof(QueueRequest) * (head % QUEUE_SLOTS)) + (2 * sizeof(uchar*));
+        post_rdma_read(
+            (void*)output_image_r_addr,
+            IMG_BYTES,
+            mr_images_out->lkey,
+            (uint64_t)request.result,
+            gpu_queues_parameters.mr_images_out_rkey,
+            wc.wr_id
+        );
+
+        while (( ncqes = ibv_poll_cq(cq, 1, &wc)) == 0) { }
+        if (ncqes < 0) {
+            perror("ibv_poll_cq() failed");
+            exit(1);
+        }
+
+        wc.wr_id = 24;
+
+        gpu_to_cpu_head = gpu_to_cpu_ring_buff._head + 1;
+        uint64_t head_remote_addr = (uint64_t)ring_buffer + sizeof(size_t) + (sizeof(QueueRequest) * QUEUE_SLOTS);
+        post_rdma_write(
+            head_remote_addr,
+            atomic_sizet_size,
+            gpu_queues_parameters.gpu_to_cpu_mr_rkey,
+            &gpu_to_cpu_head,
+            gpu_to_cpu_head_mr->lkey,
+            wc.wr_id
+        );
+
+        while (( ncqes = ibv_poll_cq(cq, 1, &wc)) == 0) { }
+        if (ncqes < 0) {
+            perror("ibv_poll_cq() failed");
+            exit(1);
+        }
+
+        send_cqes_received++;
+        *img_id = request.image_id;
+
+        printf("Dequeued job\n");
+
+        return true;
     }
 };
 
