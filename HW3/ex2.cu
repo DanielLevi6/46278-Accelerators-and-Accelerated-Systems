@@ -218,11 +218,8 @@ struct queue
     using entry = entry_type;
 
     entry data[NSLOTS];
-    char pad_a[128];
     cuda::atomic<int> pi;
-    char pad_b[128];
     cuda::atomic<int> ci;
-    char pad_c[128];
     cuda::atomic<bool> kill;
 
     queue():
@@ -251,18 +248,6 @@ struct queue
         data[cur_pi & (NSLOTS - 1)] = *ent;
         pi.store(cur_pi+1, memory_order_release);        
         return true;
-    }
-
-    __host__ __device__ bool is_full() {
-        int cur_pi = pi.load(memory_order_acquire);
-        int cur_ci = ci.load(memory_order_relaxed);
-        return (cur_pi-cur_ci) == NSLOTS;
-    }
-
-    __host__ __device__ bool is_empty() {
-        int cur_pi = pi.load(memory_order_acquire);
-        int cur_ci = ci.load(memory_order_relaxed);
-        return (cur_pi-cur_ci) == 0;
     }
 };
 
